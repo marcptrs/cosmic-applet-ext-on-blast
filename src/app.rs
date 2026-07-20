@@ -43,6 +43,11 @@ const IDLE_ICON: &str = "io.github.cosmic-applet-now-playing-symbolic";
 /// album art, so the panel layout stays stable between tracks.
 const NO_ART_ICON: &str = "media-optical-symbolic";
 
+/// How many times to (re)fetch a track's art URL before giving up. At the 500ms
+/// poll cadence this retries for ~3s, enough to ride out a server generating a
+/// resized cover variant on first request without hammering a genuinely-bad URL.
+const MAX_ART_ATTEMPTS: u8 = 6;
+
 #[derive(Default)]
 pub struct AppModel {
     core: Core,
@@ -56,6 +61,11 @@ pub struct AppModel {
     player: PlayerInfo,
     album_art: Option<cosmic::iced::widget::image::Handle>,
     current_art_url: Option<String>,
+    /// Fetch attempts made for `current_art_url`. Servers like Jellyfin generate
+    /// resized cover variants lazily, so the first fetch after a track change can
+    /// miss transiently; we retry for a few ticks rather than blanking the art
+    /// for the whole song. Reset when the art URL changes.
+    art_attempts: u8,
     seeking: Option<f64>,
     missed_polls: u8,
     /// All MPRIS players seen on the last poll, for the picker.
@@ -73,7 +83,10 @@ pub enum Message {
     Tick,
     Polled(Poll),
     SelectPlayer(String),
-    ArtLoaded(Option<cosmic::iced::widget::image::Handle>),
+    ArtLoaded {
+        url: String,
+        handle: Option<cosmic::iced::widget::image::Handle>,
+    },
     PlayPause,
     Next,
     Previous,
@@ -674,6 +687,7 @@ impl cosmic::Application for AppModel {
                 self.selected_player = Some(bus_name);
                 self.album_art = None;
                 self.current_art_url = None;
+                self.art_attempts = 0;
                 self.seeking = None;
             }
 
@@ -696,6 +710,7 @@ impl cosmic::Application for AppModel {
                             self.player = PlayerInfo::default();
                             self.album_art = None;
                             self.current_art_url = None;
+                            self.art_attempts = 0;
                             self.seeking = None;
                         }
                     }
@@ -713,26 +728,29 @@ impl cosmic::Application for AppModel {
                     }
                 }
 
-                if info == self.player {
-                    return Task::none();
-                }
-                let new_art_url = info.art_url.clone();
+                // Reconcile album art first, independent of whether the rest of
+                // the player state changed, so a retry can still fire on an
+                // otherwise-identical tick (e.g. a paused track whose position
+                // never advances).
+                let art_task = self.reconcile_art(info.art_url.as_deref());
+                let unchanged = info == self.player;
                 self.player = info;
 
-                if new_art_url != self.current_art_url {
-                    self.current_art_url = new_art_url.clone();
-                    self.album_art = None;
-                    if let Some(url) = new_art_url {
-                        return Task::perform(
-                            load_art(url),
-                            |handle| cosmic::Action::App(Message::ArtLoaded(handle)),
-                        );
-                    }
+                if let Some(task) = art_task {
+                    return task;
+                }
+                if unchanged {
+                    return Task::none();
                 }
             }
 
-            Message::ArtLoaded(handle) => {
-                self.album_art = handle;
+            Message::ArtLoaded { url, handle } => {
+                // Ignore results for a track we've since moved past. On failure
+                // leave `album_art` as-is (None) so `reconcile_art` retries on a
+                // later tick until it succeeds or exhausts its attempts.
+                if self.current_art_url.as_deref() == Some(url.as_str()) && handle.is_some() {
+                    self.album_art = handle;
+                }
             }
 
             Message::PlayPause => {
@@ -802,6 +820,46 @@ impl cosmic::Application for AppModel {
     }
 }
 
+impl AppModel {
+    /// Reconcile album art against the currently-playing track's art URL,
+    /// returning a fetch task when one should start.
+    ///
+    /// Fires on a new URL (track change) and also retries — up to
+    /// [`MAX_ART_ATTEMPTS`] — while the current URL still has no loaded art, so a
+    /// transient miss (e.g. a server generating a resized cover on first request)
+    /// self-heals within a few ticks instead of blanking the art for the whole
+    /// song. Returns `None` once art is loaded, retries are exhausted, or the
+    /// track exposes no art.
+    fn reconcile_art(&mut self, art_url: Option<&str>) -> Option<Task<Message>> {
+        let Some(url) = art_url else {
+            // Track exposes no art; clear any stale cover.
+            self.current_art_url = None;
+            self.album_art = None;
+            self.art_attempts = 0;
+            return None;
+        };
+
+        if self.current_art_url.as_deref() != Some(url) {
+            // New track/URL: reset and start loading.
+            self.current_art_url = Some(url.to_string());
+            self.album_art = None;
+            self.art_attempts = 0;
+        } else if self.album_art.is_some() || self.art_attempts >= MAX_ART_ATTEMPTS {
+            // Already loaded, or retries exhausted for this URL.
+            return None;
+        }
+
+        self.art_attempts += 1;
+        let url = url.to_string();
+        Some(Task::perform(load_art(url.clone()), move |handle| {
+            cosmic::Action::App(Message::ArtLoaded {
+                url: url.clone(),
+                handle,
+            })
+        }))
+    }
+}
+
 fn format_time(us: u64) -> String {
     let secs = us / 1_000_000;
     let mins = secs / 60;
@@ -822,10 +880,21 @@ async fn load_art(url: String) -> Option<cosmic::iced::widget::image::Handle> {
     let bytes: Vec<u8> = if let Some(path) = url.strip_prefix("file://") {
         tokio::fs::read(path).await.ok()?
     } else {
-        match reqwest::get(&url).await {
-            Ok(resp) => resp.bytes().await.ok().map(|b| b.to_vec())?,
-            Err(_) => return None,
+        // A bounded timeout keeps a slow/hung fetch from stacking up across the
+        // retries `reconcile_art` schedules; it also frees the connection instead
+        // of leaking it if the server never responds.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .ok()?;
+        let resp = client.get(&url).send().await.ok()?;
+        // Servers hand back a non-2xx error page (Jellyfin returns a JSON 404
+        // while an image variant is still being generated). Reject those rather
+        // than feeding the error body to the image decoder.
+        if !resp.status().is_success() {
+            return None;
         }
+        resp.bytes().await.ok().map(|b| b.to_vec())?
     };
 
     // Players (e.g. Plexamp) sometimes hand us wide banner art rather than a
@@ -840,18 +909,19 @@ async fn load_art(url: String) -> Option<cosmic::iced::widget::image::Handle> {
 }
 
 /// Decodes encoded image `bytes` and returns a centred square crop as an RGBA
-/// handle. Falls back to the raw encoded bytes if decoding fails.
+/// handle, or `None` if the bytes aren't a decodable image.
+///
+/// Returning `None` (rather than wrapping the raw bytes in a handle) matters:
+/// the renderer decodes via this same `image` crate, so bytes we can't decode it
+/// can't either — they'd render as a blank tile. A `None` instead lets the caller
+/// treat the fetch as failed and retry.
 fn crop_square(bytes: &[u8]) -> Option<cosmic::iced::widget::image::Handle> {
     use cosmic::iced::widget::image::Handle;
-    match image::load_from_memory(bytes) {
-        Ok(img) => {
-            let (w, h) = (img.width(), img.height());
-            let side = w.min(h);
-            let x = (w - side) / 2;
-            let y = (h - side) / 2;
-            let rgba = img.crop_imm(x, y, side, side).into_rgba8();
-            Some(Handle::from_rgba(side, side, rgba.into_raw()))
-        }
-        Err(_) => Some(Handle::from_bytes(bytes.to_vec())),
-    }
+    let img = image::load_from_memory(bytes).ok()?;
+    let (w, h) = (img.width(), img.height());
+    let side = w.min(h);
+    let x = (w - side) / 2;
+    let y = (h - side) / 2;
+    let rgba = img.crop_imm(x, y, side, side).into_rgba8();
+    Some(Handle::from_rgba(side, side, rgba.into_raw()))
 }
