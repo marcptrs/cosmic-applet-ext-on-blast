@@ -9,15 +9,19 @@ description = "Now Playing applet for COSMIC Desktop — inline panel art, label
 vergen = { version = "8", features = ["git", "gitcl"] }
 
 [dependencies]
-anyhow = "1"
 cosmic-config = { git = "https://github.com/pop-os/libcosmic.git" }
+dbus = "0.9"
 i18n-embed-fl = "0.9"
-image = "0.25"
+# Only the image formats album art actually ships as; the default feature set
+# compiles in a dozen decoders (tiff, exr, dds, …) we never touch.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 mpris = "2"
 reqwest = { version = "0.12", features = ["default-tls"] }
 rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["full"] }
+# spawn_blocking + tokio::fs is all we use directly; the rest of the runtime is
+# pulled in (with a superset of features) by libcosmic and reqwest anyway.
+tokio = { version = "1", features = ["rt-multi-thread", "fs"] }
 
 [dependencies.i18n-embed]
 version = "0.15"

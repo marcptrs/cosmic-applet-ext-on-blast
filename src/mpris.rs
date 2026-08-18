@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0
 
 use std::cell::RefCell;
+use std::time::Duration;
 
+use dbus::blocking::Connection;
 use mpris::{PlaybackStatus, Player, PlayerFinder};
 
-/// `playerctld` is a proxy meta-player that mirrors whichever real player is
-/// active. Because it shadows another player, including it in selection causes
-/// flicker: a poll may resolve `playerctld` (whose forwarded metadata is briefly
-/// empty between hand-offs) instead of the real player, blanking the panel for a
-/// tick before flipping back. We always skip it and select among real players.
+/// Proxy meta-player mirroring whichever player is active. Its metadata is
+/// briefly empty between hand-offs and blanks the panel, so it's always skipped.
 const PLAYERCTLD: &str = "playerctld";
+
+/// D-Bus well-known name prefix every MPRIS player advertises.
+const MPRIS_PREFIX: &str = "org.mpris.MediaPlayer2.";
+
+/// Timeout for the cheap `ListNames` bus enumeration each poll.
+const LIST_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerInfo {
@@ -50,8 +55,7 @@ impl Default for PlayerInfo {
     }
 }
 
-/// A lightweight entry for the player picker: enough to label and identify each
-/// available MPRIS player without fetching its full state.
+/// Enough to label and identify a player in the picker, without its full state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlayerSummary {
     pub bus_name: String,
@@ -60,80 +64,158 @@ pub struct PlayerSummary {
     pub title: String,
 }
 
-/// One poll tick's worth of state: the player whose info to display (honoring a
-/// pinned selection, else auto-picked) plus the list of all available players.
+/// One tick: the player to display (pinned, else auto-picked) and all of them.
 #[derive(Debug, Clone, Default)]
 pub struct Poll {
     pub player: Option<PlayerInfo>,
     pub players: Vec<PlayerSummary>,
 }
 
-thread_local! {
-    /// A per-worker-thread cached `PlayerFinder` holding one long-lived D-Bus
-    /// connection. Opening a fresh connection on every poll (~2/sec) was never
-    /// reclaimed and ballooned the host cosmic-panel process by GBs over a session.
-    static FINDER: RefCell<Option<PlayerFinder>> = const { RefCell::new(None) };
+/// Transport capabilities; cached per-player since they change rarely and each
+/// field is its own D-Bus round trip.
+#[derive(Debug, Clone, Copy, Default)]
+struct Caps {
+    next: bool,
+    prev: bool,
+    pause: bool,
+    play: bool,
+    seek: bool,
 }
 
-/// Poll MPRIS players once.
-///
-/// `selected` pins a specific player by trimmed bus name; if it's set and that
-/// player is present, its info is returned. Otherwise we auto-pick the most
-/// likely active player. `players` always lists every real player (excluding the
-/// `playerctld` proxy) so the UI can offer a picker.
-///
-/// `player` is `None` when no player resolved this tick (genuinely none, or a
-/// transient D-Bus error). Callers treat that as "no fresh data", not "stopped".
-pub fn poll(selected: Option<&str>) -> Poll {
-    let Some(all) = find_all_players() else { return Poll::default() };
+/// Per-thread MPRIS state. A fresh D-Bus connection per poll was never reclaimed
+/// and grew the host panel by GBs, so connections and players are long-lived.
+struct Cache {
+    finder: PlayerFinder,
+    conn: Connection,
+    players: Vec<Player>,
+    bus_set: Vec<String>,
+    caps: Option<(String, Caps)>,
+}
 
-    // Drop the playerctld shadow proxy; it duplicates a real player.
-    let real: Vec<Player> = all
-        .into_iter()
-        .filter(|p| p.bus_name_trimmed() != PLAYERCTLD)
-        .collect();
+thread_local! {
+    static CACHE: RefCell<Option<Cache>> = const { RefCell::new(None) };
+}
 
-    let players: Vec<PlayerSummary> = real
+/// `selected` pins a player by trimmed bus name, else the most likely active one
+/// wins. `popup_open` gates the extras; `player` is `None` when none resolved.
+pub fn poll(selected: Option<&str>, popup_open: bool) -> Poll {
+    CACHE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        match poll_cached(&mut slot, selected, popup_open) {
+            Some(poll) => poll,
+            None => {
+                // Possibly a stale connection: reconnect on the next poll.
+                *slot = None;
+                Poll::default()
+            }
+        }
+    })
+}
+
+fn poll_cached(
+    slot: &mut Option<Cache>,
+    selected: Option<&str>,
+    popup_open: bool,
+) -> Option<Poll> {
+    let cache = ensure_cache(slot)?;
+
+    // Cheap enumeration: only rebuild the (expensive) `Player` objects when the
+    // set of live MPRIS buses actually changed.
+    let current = mpris_bus_set(&cache.conn)?;
+    if current != cache.bus_set {
+        let all = cache.finder.find_all().ok()?;
+        cache.players = all
+            .into_iter()
+            .filter(|p| p.bus_name_trimmed() != PLAYERCTLD)
+            .collect();
+        cache.bus_set = sorted_trimmed(&cache.players);
+    }
+
+    let chosen_idx = selected
+        .and_then(|sel| cache.players.iter().position(|p| p.bus_name_trimmed() == sel));
+
+    // Status only matters for auto-picking and titles only for the picker, so a
+    // pinned player with the popup closed needs neither read.
+    let need_summaries = popup_open || chosen_idx.is_none();
+    let players: Vec<PlayerSummary> = cache
+        .players
         .iter()
         .map(|p| PlayerSummary {
             bus_name: p.bus_name_trimmed().to_string(),
             identity: p.identity().to_string(),
-            status: p.get_playback_status().unwrap_or(PlaybackStatus::Stopped),
-            title: p
-                .get_metadata()
-                .ok()
-                .and_then(|m| m.title().map(str::to_string))
-                .unwrap_or_default(),
+            status: if need_summaries {
+                p.get_playback_status().unwrap_or(PlaybackStatus::Stopped)
+            } else {
+                PlaybackStatus::Stopped
+            },
+            title: if popup_open {
+                p.get_metadata()
+                    .ok()
+                    .and_then(|m| m.title().map(str::to_string))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            },
         })
         .collect();
 
-    // Honor a pinned selection if it's still present, else auto-pick.
-    let chosen = selected
-        .and_then(|bus| players.iter().position(|s| s.bus_name == bus))
-        .or_else(|| pick_active_index(&players));
+    let chosen = chosen_idx.or_else(|| pick_active_index(&players));
 
-    let player = chosen.map(|i| player_info(&real[i]));
+    let player = chosen.map(|i| {
+        // Reuse the status we already read in the summary pass when we have it.
+        let status = if need_summaries {
+            Some(players[i].status)
+        } else {
+            None
+        };
+        player_info(&cache.players[i], status, popup_open, &mut cache.caps)
+    });
 
-    Poll { player, players }
+    Some(Poll { player, players })
 }
 
-/// Find all MPRIS players via the per-thread cached `PlayerFinder` (one reused
-/// D-Bus connection), recreating it if the cached connection has gone stale.
-fn find_all_players() -> Option<Vec<Player>> {
-    FINDER.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        if slot.is_none() {
-            *slot = PlayerFinder::new().ok();
-        }
-        match slot.as_ref()?.find_all() {
-            Ok(players) => Some(players),
-            Err(_) => {
-                // The cached connection may be stale; drop it so the next poll reconnects.
-                *slot = None;
-                None
-            }
-        }
-    })
+/// Borrow the per-thread cache, creating the D-Bus connections on first use.
+fn ensure_cache(slot: &mut Option<Cache>) -> Option<&mut Cache> {
+    if slot.is_none() {
+        let finder = PlayerFinder::new().ok()?;
+        let conn = Connection::new_session().ok()?;
+        *slot = Some(Cache {
+            finder,
+            conn,
+            players: Vec::new(),
+            bus_set: Vec::new(),
+            caps: None,
+        });
+    }
+    slot.as_mut()
+}
+
+/// Enumerate live MPRIS buses (trimmed, sorted, `playerctld` excluded) with a
+/// single `ListNames` call — far cheaper than constructing a `Player` per bus.
+fn mpris_bus_set(conn: &Connection) -> Option<Vec<String>> {
+    let proxy = conn.with_proxy(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        LIST_TIMEOUT,
+    );
+    let (names,): (Vec<String>,) = proxy
+        .method_call("org.freedesktop.DBus", "ListNames", ())
+        .ok()?;
+    let mut set: Vec<String> = names
+        .into_iter()
+        .filter_map(|n| n.strip_prefix(MPRIS_PREFIX).map(str::to_string))
+        .filter(|n| n != PLAYERCTLD)
+        .collect();
+    set.sort();
+    Some(set)
+}
+
+/// Sorted trimmed bus names, to compare against a fresh enumeration.
+fn sorted_trimmed(players: &[Player]) -> Vec<String> {
+    let mut set: Vec<String> =
+        players.iter().map(|p| p.bus_name_trimmed().to_string()).collect();
+    set.sort();
+    set
 }
 
 /// Pick the index of the most likely active player from the summaries,
@@ -141,38 +223,38 @@ fn find_all_players() -> Option<Vec<Player>> {
 fn pick_active_index(players: &[PlayerSummary]) -> Option<usize> {
     let mut first_paused = None;
     let mut first_with_track = None;
-    let mut first_found = None;
 
     for (i, s) in players.iter().enumerate() {
-        if s.status == PlaybackStatus::Playing {
-            return Some(i);
-        }
-        if first_paused.is_none() && s.status == PlaybackStatus::Paused {
-            first_paused = Some(i);
-        } else if first_with_track.is_none() && !s.title.is_empty() {
-            first_with_track = Some(i);
-        } else if first_found.is_none() {
-            first_found = Some(i);
+        match s.status {
+            PlaybackStatus::Playing => return Some(i),
+            PlaybackStatus::Paused if first_paused.is_none() => first_paused = Some(i),
+            _ if first_with_track.is_none() && !s.title.is_empty() => {
+                first_with_track = Some(i)
+            }
+            _ => {}
         }
     }
 
-    first_paused.or(first_with_track).or(first_found)
+    first_paused
+        .or(first_with_track)
+        .or_else(|| (!players.is_empty()).then_some(0))
 }
 
-/// Build the full `PlayerInfo` for one player (a batch of MPRIS property reads).
-fn player_info(player: &Player) -> PlayerInfo {
+/// `status` reuses a value already read this poll when available; `popup_open`
+/// gates position and capabilities, which only the popup shows.
+fn player_info(
+    player: &Player,
+    status: Option<PlaybackStatus>,
+    popup_open: bool,
+    caps_memo: &mut Option<(String, Caps)>,
+) -> PlayerInfo {
     let metadata = player.get_metadata().unwrap_or_default();
-    let status = player
-        .get_playback_status()
-        .unwrap_or(PlaybackStatus::Stopped);
+    let status = status.unwrap_or_else(|| {
+        player.get_playback_status().unwrap_or(PlaybackStatus::Stopped)
+    });
 
     let title = metadata.title().unwrap_or("Unknown").to_string();
-
-    let artist = metadata
-        .artists()
-        .map(|a| a.join(", "))
-        .unwrap_or_default();
-
+    let artist = metadata.artists().map(|a| a.join(", ")).unwrap_or_default();
     let album = metadata.album_name().unwrap_or("").to_string();
 
     let year = metadata
@@ -188,57 +270,155 @@ fn player_info(player: &Player) -> PlayerInfo {
 
     let art_url = metadata.art_url().map(|u| u.to_string());
     let bus_name = player.bus_name_trimmed().to_string();
-    let position_us = player.get_position_in_microseconds().unwrap_or(0);
     let length_us = metadata.length_in_microseconds().unwrap_or(0);
-    let can_go_next = player.can_go_next().unwrap_or(false);
-    let can_go_previous = player.can_go_previous().unwrap_or(false);
-    let can_pause = player.can_pause().unwrap_or(false);
-    let can_play = player.can_play().unwrap_or(false);
-    let can_seek = player.can_seek().unwrap_or(false);
+
+    let position_us = if popup_open {
+        player.get_position_in_microseconds().unwrap_or(0)
+    } else {
+        0
+    };
+
+    let caps = if popup_open {
+        caps_for(player, &bus_name, caps_memo)
+    } else {
+        Caps::default()
+    };
 
     PlayerInfo {
-        title, artist, album, year, status, art_url, bus_name, position_us, length_us,
-        can_go_next, can_go_previous, can_pause, can_play, can_seek,
+        title,
+        artist,
+        album,
+        year,
+        status,
+        art_url,
+        bus_name,
+        position_us,
+        length_us,
+        can_go_next: caps.next,
+        can_go_previous: caps.prev,
+        can_pause: caps.pause,
+        can_play: caps.play,
+        can_seek: caps.seek,
     }
 }
 
-pub fn seek_by(bus_name: &str, offset_us: i64) {
-    if let Ok(player) = find_by_bus(bus_name) {
-        let _ = player.seek(offset_us);
+/// Return the player's capabilities, reusing the memo when the chosen player is
+/// unchanged (each field is a separate D-Bus round trip).
+fn caps_for(player: &Player, bus_name: &str, memo: &mut Option<(String, Caps)>) -> Caps {
+    if let Some((bus, caps)) = memo {
+        if bus == bus_name {
+            return *caps;
+        }
     }
+    let caps = Caps {
+        next: player.can_go_next().unwrap_or(false),
+        prev: player.can_go_previous().unwrap_or(false),
+        pause: player.can_pause().unwrap_or(false),
+        play: player.can_play().unwrap_or(false),
+        seek: player.can_seek().unwrap_or(false),
+    };
+    *memo = Some((bus_name.to_string(), caps));
+    caps
 }
 
 pub fn seek_to(bus_name: &str, position_us: u64, current_position_us: u64) {
-    if let Ok(player) = find_by_bus(bus_name) {
+    with_player(bus_name, |p| {
         let delta = position_us as i64 - current_position_us as i64;
-        let _ = player.seek(delta);
-    }
+        let _ = p.seek(delta);
+    });
 }
 
 pub fn play_pause(bus_name: &str) {
-    if let Ok(player) = find_by_bus(bus_name) {
-        let _ = player.play_pause();
-    }
+    with_player(bus_name, |p| {
+        let _ = p.play_pause();
+    });
 }
 
 pub fn next(bus_name: &str) {
-    if let Ok(player) = find_by_bus(bus_name) {
-        let _ = player.next();
-    }
+    with_player(bus_name, |p| {
+        let _ = p.next();
+    });
 }
 
 pub fn previous(bus_name: &str) {
-    if let Ok(player) = find_by_bus(bus_name) {
-        let _ = player.previous();
-    }
+    with_player(bus_name, |p| {
+        let _ = p.previous();
+    });
 }
 
-fn find_by_bus(bus_name: &str) -> anyhow::Result<mpris::Player> {
-    let finder = PlayerFinder::new()?;
-    for player in finder.find_all()? {
-        if player.bus_name_trimmed() == bus_name {
-            return Ok(player);
+/// Run `f` against the cached `Player`, refreshing the cache if it isn't known.
+/// Reuses polling's connection rather than opening one per control action.
+fn with_player<F: FnOnce(&Player)>(bus_name: &str, f: F) {
+    CACHE.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let Some(cache) = ensure_cache(&mut slot) else {
+            return;
+        };
+        if !cache.players.iter().any(|p| p.bus_name_trimmed() == bus_name) {
+            if let Ok(all) = cache.finder.find_all() {
+                cache.players = all
+                    .into_iter()
+                    .filter(|p| p.bus_name_trimmed() != PLAYERCTLD)
+                    .collect();
+                cache.bus_set = sorted_trimmed(&cache.players);
+            }
+        }
+        if let Some(p) = cache.players.iter().find(|p| p.bus_name_trimmed() == bus_name) {
+            f(p);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(status: PlaybackStatus, title: &str) -> PlayerSummary {
+        PlayerSummary {
+            bus_name: title.to_string(),
+            identity: title.to_string(),
+            status,
+            title: title.to_string(),
         }
     }
-    anyhow::bail!("player not found: {bus_name}")
+
+    #[test]
+    fn pick_prefers_playing() {
+        let players = vec![
+            summary(PlaybackStatus::Paused, "a"),
+            summary(PlaybackStatus::Playing, "b"),
+            summary(PlaybackStatus::Stopped, "c"),
+        ];
+        assert_eq!(pick_active_index(&players), Some(1));
+    }
+
+    #[test]
+    fn pick_falls_back_to_paused_then_track_then_first() {
+        assert_eq!(
+            pick_active_index(&[
+                summary(PlaybackStatus::Stopped, ""),
+                summary(PlaybackStatus::Paused, "b"),
+            ]),
+            Some(1)
+        );
+        assert_eq!(
+            pick_active_index(&[
+                summary(PlaybackStatus::Stopped, ""),
+                summary(PlaybackStatus::Stopped, "has-track"),
+            ]),
+            Some(1)
+        );
+        assert_eq!(
+            pick_active_index(&[
+                summary(PlaybackStatus::Stopped, ""),
+                summary(PlaybackStatus::Stopped, ""),
+            ]),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn pick_empty_is_none() {
+        assert_eq!(pick_active_index(&[]), None);
+    }
 }
