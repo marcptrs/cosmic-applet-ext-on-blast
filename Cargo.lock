@@ -873,24 +873,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cosmic-applet-now-playing"
-version = "0.1.0"
-dependencies = [
- "cosmic-config",
- "dbus",
- "i18n-embed 0.15.4",
- "i18n-embed-fl 0.9.4",
- "image",
- "libcosmic",
- "mpris",
- "reqwest",
- "rust-embed",
- "serde",
- "tokio",
- "vergen",
-]
-
-[[package]]
 name = "cosmic-client-toolkit"
 version = "0.2.0"
 source = "git+https://github.com/pop-os/cosmic-protocols?rev=c253ec1#c253ec1d6804afbcdf250f5cc37ae1194bba7bd2"
@@ -931,6 +913,24 @@ source = "git+https://github.com/pop-os/libcosmic.git#a991d7bb433f67016c1473e8e4
 dependencies = [
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "cosmic-ext-applet-on-blast"
+version = "0.1.0"
+dependencies = [
+ "cosmic-config",
+ "dbus",
+ "i18n-embed 0.15.4",
+ "i18n-embed-fl 0.9.4",
+ "image",
+ "libcosmic",
+ "mpris",
+ "reqwest",
+ "rust-embed",
+ "serde",
+ "tokio",
+ "vergen",
 ]
 
 [[package]]
