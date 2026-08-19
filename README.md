@@ -13,8 +13,11 @@ player (Plexamp, Spotify, browsers, mpv, etc.).
 - **Inline panel display** — album-art thumbnail plus a two-line title/artist
   label. The label auto-sizes to the panel height and collapses to a single line
   on very thin panels.
-- **Large album art popup** — 300×300 cover art with title, artist, and album
-  (plus release year when available).
+
+  ![Panel display](resources/panel.png)
+
+- **Large album art popup** — a square cover filling the popup width, with
+  title, artist, and album (plus release year when available).
 - **Media controls** — previous / play-pause / next, a seek bar, and ±10s skip.
 - **Quick panel gestures** — scroll over the applet to change tracks,
   middle-click to play/pause.
@@ -23,11 +26,13 @@ player (Plexamp, Spotify, browsers, mpv, etc.).
 
 ## Settings
 
-Available at the top of the popup:
+Open the gear button in the popup for a nested settings pane:
 
 - **Panel label length** — max characters shown in the panel label.
 - **Track before artist** — show the title before the artist (default: artist
   first).
+
+![Settings](resources/settings.png)
 
 ## Building
 
@@ -47,12 +52,9 @@ This installs the binary, desktop entry, metainfo, and icon. To uninstall:
 sudo just uninstall
 ```
 
-After updating, restart the running instance so the panel picks up the new
-binary:
-
-```sh
-pkill -f cosmic-applet-now-playing
-```
+After updating, the panel needs to relaunch the applet to pick up the new
+binary. Remove and re-add it via **COSMIC Settings → Desktop → Panel → Configure
+panel applets**.
 
 ## License
 
