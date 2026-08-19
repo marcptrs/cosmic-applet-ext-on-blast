@@ -21,7 +21,7 @@ use crate::config::Config;
 use crate::mpris::{PlayerInfo, PlayerSummary, Poll};
 
 static PANEL_AUTOSIZE_ID: LazyLock<widget::Id> =
-    LazyLock::new(|| widget::Id::new("now-playing-panel"));
+    LazyLock::new(|| widget::Id::new("on-blast-panel"));
 
 /// Minimum panel height for the two-line title/artist stack; thinner panels
 /// fall back to a single line.
@@ -36,7 +36,7 @@ const TRACK_ICON: &str = "emblem-music-symbolic";
 const ARTIST_ICON: &str = "system-users-symbolic";
 
 /// Shown in the panel when nothing is playing.
-const IDLE_ICON: &str = "io.github.cosmic-applet-now-playing-symbolic";
+const IDLE_ICON: &str = "io.github.cosmic-ext-applet-on-blast-symbolic";
 
 /// Stands in for a missing cover so the panel width stays stable.
 const NO_ART_ICON: &str = "media-optical-symbolic";
@@ -109,7 +109,7 @@ impl cosmic::Application for AppModel {
     type Flags = ();
     type Message = Message;
 
-    const APP_ID: &'static str = "io.github.cosmic-applet-now-playing";
+    const APP_ID: &'static str = "io.github.cosmic-ext-applet-on-blast";
 
     fn core(&self) -> &Core {
         &self.core
@@ -1113,7 +1113,7 @@ fn art_cache_dir() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("cosmic-applet-now-playing").join("art"))
+    Some(base.join("cosmic-ext-applet-on-blast").join("art"))
 }
 
 /// Deterministic cache path for an art URL. `DefaultHasher` has a fixed seed, so

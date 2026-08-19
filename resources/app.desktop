@@ -1,12 +1,12 @@
 [Desktop Entry]
-Name=Now Playing
+Name=On Blast
 Comment=Inline panel track info and controls via MPRIS
 Type=Application
-Icon=io.github.cosmic-applet-now-playing-symbolic
-Exec=cosmic-applet-now-playing
+Icon=io.github.cosmic-ext-applet-on-blast-symbolic
+Exec=cosmic-ext-applet-on-blast
 Terminal=false
 StartupNotify=true
 Categories=COSMIC;
-Keywords=COSMIC;Applet;Music;Media;MPRIS;Now Playing;
+Keywords=COSMIC;Applet;Music;Media;MPRIS;On Blast;
 NoDisplay=true
 X-CosmicApplet=true

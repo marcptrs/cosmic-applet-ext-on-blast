@@ -1,4 +1,4 @@
-# Now Playing — COSMIC Applet
+# On Blast — COSMIC Applet
 
 A now-playing applet for the [COSMIC™ desktop](https://system76.com/cosmic) that
 keeps the focus on the album art. It shows the current track inline on the panel
@@ -6,7 +6,7 @@ and opens a popup with large cover art, track info, a seek bar, and media
 controls — driven by any [MPRIS2](https://specifications.freedesktop.org/mpris-spec/latest/)
 player (Plexamp, Spotify, browsers, mpv, etc.).
 
-![Now Playing applet](resources/screenshot.png)
+![On Blast applet](resources/screenshot.png)
 
 ## Features
 
