@@ -501,35 +501,39 @@ impl cosmic::Application for AppModel {
                                 // One non-wrapping line each, so the block is the
                                 // same height for every track.
                                 use cosmic::iced::advanced::text::Wrapping;
-                                let mut info: Vec<Element<'_, Message>> = vec![
-                                    widget::button::custom(
-                                        widget::text::title4(scroll_label(
-                                            &state.player.title,
-                                            POPUP_TITLE_CHARS,
-                                            state.title_scroll,
-                                        ))
-                                        .wrapping(Wrapping::None),
-                                    )
-                                    .class(scrim_row_button(false))
-                                    .width(Length::Fill)
-                                    .on_press(Message::ScrollTitle)
-                                    .into(),
-                                ];
+                                let title = widget::text::title4(scroll_label(
+                                    &state.player.title,
+                                    POPUP_TITLE_CHARS,
+                                    state.title_scroll,
+                                ))
+                                .wrapping(Wrapping::None);
+                                let title: Element<'_, Message> =
+                                    if state.player.title.chars().count() > POPUP_TITLE_CHARS {
+                                        widget::button::custom(title)
+                                            .class(scrim_row_button(false))
+                                            .width(Length::Fill)
+                                            .on_press(Message::ScrollTitle)
+                                            .into()
+                                    } else {
+                                        title.into()
+                                    };
+                                let mut info = vec![title];
                                 let secondary = secondary_line(&state.player);
-                                info.push(
-                                    widget::button::custom(
-                                        widget::text::body(scroll_label(
-                                            &secondary,
-                                            POPUP_SECONDARY_CHARS,
-                                            state.secondary_scroll,
-                                        ))
-                                        .wrapping(Wrapping::None),
-                                    )
-                                    .class(scrim_row_button(false))
-                                    .width(Length::Fill)
-                                    .on_press(Message::ScrollSecondary)
-                                    .into(),
-                                );
+                                let secondary_text = widget::text::body(scroll_label(
+                                    &secondary,
+                                    POPUP_SECONDARY_CHARS,
+                                    state.secondary_scroll,
+                                ))
+                                .wrapping(Wrapping::None);
+                                info.push(if secondary.chars().count() > POPUP_SECONDARY_CHARS {
+                                    widget::button::custom(secondary_text)
+                                        .class(scrim_row_button(false))
+                                        .width(Length::Fill)
+                                        .on_press(Message::ScrollSecondary)
+                                        .into()
+                                } else {
+                                    secondary_text.into()
+                                });
 
                                 // One row per player, only when there's a choice.
                                 let player_picker: Option<Element<'_, Message>> =
