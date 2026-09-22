@@ -44,6 +44,7 @@ const NO_ART_ICON: &str = "media-optical-symbolic";
 /// Art fetches per URL before giving up. At the 500ms poll cadence that retries
 /// for ~3s, enough to ride out a server generating a cover variant on demand.
 const MAX_ART_ATTEMPTS: u8 = 6;
+const POPUP_TITLE_CHARS: usize = 28;
 
 #[derive(Default)]
 pub struct AppModel {
@@ -77,6 +78,7 @@ pub struct AppModel {
     /// Accumulated scroll notches, so a touchpad's pixel stream skips one track
     /// per notch rather than per event.
     scroll_accum: f32,
+    title_scroll: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +104,8 @@ pub enum Message {
     TrackFirstChanged(bool),
     SeekChanged(f64),
     SeekCommit,
+    ScrollTitle,
+    AdvanceTitle,
 }
 
 impl cosmic::Application for AppModel {
@@ -271,18 +275,26 @@ impl cosmic::Application for AppModel {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
+        let mut subscriptions = vec![
             cosmic::iced::time::every(Duration::from_millis(500)).map(|_| Message::Tick),
             self.core()
                 .watch_config::<Config>(Self::APP_ID)
                 .map(|update| Message::UpdateConfig(update.config)),
-        ])
+        ];
+        if self.title_scroll.is_some() && self.popup.is_some() {
+            subscriptions.push(
+                cosmic::iced::time::every(Duration::from_millis(180))
+                    .map(|_| Message::AdvanceTitle),
+            );
+        }
+        Subscription::batch(subscriptions)
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::TogglePopup => {
                 if let Some(id) = self.popup.take() {
+                    self.title_scroll = None;
                     // Tear down the settings popup too, so it can't outlive the
                     // main popup it's anchored to.
                     let mut tasks = vec![cosmic::task::message(cosmic::Action::Cosmic(
@@ -484,9 +496,17 @@ impl cosmic::Application for AppModel {
                                 // same height for every track.
                                 use cosmic::iced::advanced::text::Wrapping;
                                 let mut info: Vec<Element<'_, Message>> = vec![
-                                    widget::text::title4(truncate_label(&state.player.title, 34))
-                                        .wrapping(Wrapping::None)
-                                        .into(),
+                                    widget::button::custom(
+                                        widget::text::title4(popup_title(
+                                            &state.player.title,
+                                            state.title_scroll,
+                                        ))
+                                        .wrapping(Wrapping::None),
+                                    )
+                                    .class(scrim_row_button(false))
+                                    .width(Length::Fill)
+                                    .on_press(Message::ScrollTitle)
+                                    .into(),
                                 ];
                                 let mut secondary = state.player.artist.clone();
                                 if !state.player.album.is_empty() {
@@ -733,6 +753,7 @@ impl cosmic::Application for AppModel {
             Message::PopupClosed(id) => {
                 if self.popup.as_ref() == Some(&id) {
                     self.popup = None;
+                    self.title_scroll = None;
                 }
                 if self.settings_popup.as_ref() == Some(&id) {
                     self.settings_popup = None;
@@ -741,6 +762,19 @@ impl cosmic::Application for AppModel {
 
             Message::UpdateConfig(config) => {
                 self.config = config;
+            }
+
+            Message::ScrollTitle => {
+                if self.player.title.chars().count() > POPUP_TITLE_CHARS {
+                    self.title_scroll = Some(0);
+                }
+            }
+
+            Message::AdvanceTitle => {
+                if let Some(offset) = self.title_scroll {
+                    let last = self.player.title.chars().count().saturating_sub(POPUP_TITLE_CHARS);
+                    self.title_scroll = (offset < last + 6).then_some(offset + 1);
+                }
             }
 
             Message::Tick => {
@@ -762,6 +796,7 @@ impl cosmic::Application for AppModel {
             }
 
             Message::SelectPlayer(bus_name) => {
+                self.title_scroll = None;
                 // Reset per-player state so the old art doesn't linger.
                 self.selected_player = Some(bus_name);
                 self.album_art = None;
@@ -817,6 +852,9 @@ impl cosmic::Application for AppModel {
                 // an otherwise-identical tick.
                 let art_task = self.reconcile_art(info.art_url.as_deref());
                 let unchanged = info == self.player;
+                if info.title != self.player.title || info.bus_name != self.player.bus_name {
+                    self.title_scroll = None;
+                }
                 self.player = info;
 
                 if let Some(task) = art_task {
@@ -984,6 +1022,14 @@ fn truncate_label(s: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
+}
+
+fn popup_title(title: &str, scroll: Option<usize>) -> String {
+    let Some(offset) = scroll else {
+        return truncate_label(title, POPUP_TITLE_CHARS);
+    };
+    let last = title.chars().count().saturating_sub(POPUP_TITLE_CHARS);
+    title.chars().skip(offset.min(last)).take(POPUP_TITLE_CHARS).collect()
 }
 
 /// Cover thumbnail size: crisp enough for the popup hero, and far smaller than
@@ -1297,6 +1343,14 @@ mod tests {
     fn truncate_label_counts_chars_not_bytes() {
         // Multi-byte chars count as one each and must not be split.
         assert_eq!(truncate_label("héllo wörld", 5), "héllo\u{2026}");
+    }
+
+    #[test]
+    fn popup_title_reveals_tail_after_click() {
+        let title = "abcdefghijklmnopqrstuvwxyz123456";
+        assert_eq!(popup_title(title, None), "abcdefghijklmnopqrstuvwxyz12…");
+        assert_eq!(popup_title(title, Some(0)), "abcdefghijklmnopqrstuvwxyz12");
+        assert_eq!(popup_title(title, Some(4)), "efghijklmnopqrstuvwxyz123456");
     }
 
     #[test]
