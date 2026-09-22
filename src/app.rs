@@ -45,6 +45,7 @@ const NO_ART_ICON: &str = "media-optical-symbolic";
 /// for ~3s, enough to ride out a server generating a cover variant on demand.
 const MAX_ART_ATTEMPTS: u8 = 6;
 const POPUP_TITLE_CHARS: usize = 28;
+const POPUP_SECONDARY_CHARS: usize = 44;
 
 #[derive(Default)]
 pub struct AppModel {
@@ -79,6 +80,7 @@ pub struct AppModel {
     /// per notch rather than per event.
     scroll_accum: f32,
     title_scroll: Option<usize>,
+    secondary_scroll: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,7 +107,8 @@ pub enum Message {
     SeekChanged(f64),
     SeekCommit,
     ScrollTitle,
-    AdvanceTitle,
+    AdvanceText,
+    ScrollSecondary,
 }
 
 impl cosmic::Application for AppModel {
@@ -281,10 +284,12 @@ impl cosmic::Application for AppModel {
                 .watch_config::<Config>(Self::APP_ID)
                 .map(|update| Message::UpdateConfig(update.config)),
         ];
-        if self.title_scroll.is_some() && self.popup.is_some() {
+        if (self.title_scroll.is_some() || self.secondary_scroll.is_some())
+            && self.popup.is_some()
+        {
             subscriptions.push(
                 cosmic::iced::time::every(Duration::from_millis(180))
-                    .map(|_| Message::AdvanceTitle),
+                    .map(|_| Message::AdvanceText),
             );
         }
         Subscription::batch(subscriptions)
@@ -295,6 +300,7 @@ impl cosmic::Application for AppModel {
             Message::TogglePopup => {
                 if let Some(id) = self.popup.take() {
                     self.title_scroll = None;
+                    self.secondary_scroll = None;
                     // Tear down the settings popup too, so it can't outlive the
                     // main popup it's anchored to.
                     let mut tasks = vec![cosmic::task::message(cosmic::Action::Cosmic(
@@ -497,8 +503,9 @@ impl cosmic::Application for AppModel {
                                 use cosmic::iced::advanced::text::Wrapping;
                                 let mut info: Vec<Element<'_, Message>> = vec![
                                     widget::button::custom(
-                                        widget::text::title4(popup_title(
+                                        widget::text::title4(scroll_label(
                                             &state.player.title,
+                                            POPUP_TITLE_CHARS,
                                             state.title_scroll,
                                         ))
                                         .wrapping(Wrapping::None),
@@ -508,29 +515,20 @@ impl cosmic::Application for AppModel {
                                     .on_press(Message::ScrollTitle)
                                     .into(),
                                 ];
-                                let mut secondary = state.player.artist.clone();
-                                if !state.player.album.is_empty() {
-                                    let album_str = if let Some(y) = state.player.year {
-                                        format!("{} ({})", state.player.album, y)
-                                    } else {
-                                        state.player.album.clone()
-                                    };
-                                    secondary = if secondary.is_empty() {
-                                        album_str
-                                    } else {
-                                        format!("{secondary} \u{00b7} {album_str}")
-                                    };
-                                }
-                                // A space when empty, so the line never collapses.
-                                let secondary = if secondary.is_empty() {
-                                    " ".to_string()
-                                } else {
-                                    truncate_label(&secondary, 44)
-                                };
+                                let secondary = secondary_line(&state.player);
                                 info.push(
-                                    widget::text::body(secondary)
-                                        .wrapping(Wrapping::None)
-                                        .into(),
+                                    widget::button::custom(
+                                        widget::text::body(scroll_label(
+                                            &secondary,
+                                            POPUP_SECONDARY_CHARS,
+                                            state.secondary_scroll,
+                                        ))
+                                        .wrapping(Wrapping::None),
+                                    )
+                                    .class(scrim_row_button(false))
+                                    .width(Length::Fill)
+                                    .on_press(Message::ScrollSecondary)
+                                    .into(),
                                 );
 
                                 // One row per player, only when there's a choice.
@@ -754,6 +752,7 @@ impl cosmic::Application for AppModel {
                 if self.popup.as_ref() == Some(&id) {
                     self.popup = None;
                     self.title_scroll = None;
+                    self.secondary_scroll = None;
                 }
                 if self.settings_popup.as_ref() == Some(&id) {
                     self.settings_popup = None;
@@ -770,10 +769,23 @@ impl cosmic::Application for AppModel {
                 }
             }
 
-            Message::AdvanceTitle => {
+            Message::ScrollSecondary => {
+                if secondary_line(&self.player).chars().count() > POPUP_SECONDARY_CHARS {
+                    self.secondary_scroll = Some(0);
+                }
+            }
+
+            Message::AdvanceText => {
                 if let Some(offset) = self.title_scroll {
                     let last = self.player.title.chars().count().saturating_sub(POPUP_TITLE_CHARS);
                     self.title_scroll = (offset < last + 6).then_some(offset + 1);
+                }
+                if let Some(offset) = self.secondary_scroll {
+                    let last = secondary_line(&self.player)
+                        .chars()
+                        .count()
+                        .saturating_sub(POPUP_SECONDARY_CHARS);
+                    self.secondary_scroll = (offset < last + 6).then_some(offset + 1);
                 }
             }
 
@@ -797,6 +809,7 @@ impl cosmic::Application for AppModel {
 
             Message::SelectPlayer(bus_name) => {
                 self.title_scroll = None;
+                self.secondary_scroll = None;
                 // Reset per-player state so the old art doesn't linger.
                 self.selected_player = Some(bus_name);
                 self.album_art = None;
@@ -833,6 +846,8 @@ impl cosmic::Application for AppModel {
                             self.current_art_url = None;
                             self.art_attempts = 0;
                             self.seeking = None;
+                            self.title_scroll = None;
+                            self.secondary_scroll = None;
                         }
                     }
                     return Task::none();
@@ -854,6 +869,13 @@ impl cosmic::Application for AppModel {
                 let unchanged = info == self.player;
                 if info.title != self.player.title || info.bus_name != self.player.bus_name {
                     self.title_scroll = None;
+                }
+                if info.artist != self.player.artist
+                    || info.album != self.player.album
+                    || info.year != self.player.year
+                    || info.bus_name != self.player.bus_name
+                {
+                    self.secondary_scroll = None;
                 }
                 self.player = info;
 
@@ -1024,12 +1046,29 @@ fn truncate_label(s: &str, max_chars: usize) -> String {
     }
 }
 
-fn popup_title(title: &str, scroll: Option<usize>) -> String {
+fn scroll_label(label: &str, max_chars: usize, scroll: Option<usize>) -> String {
     let Some(offset) = scroll else {
-        return truncate_label(title, POPUP_TITLE_CHARS);
+        return truncate_label(label, max_chars);
     };
-    let last = title.chars().count().saturating_sub(POPUP_TITLE_CHARS);
-    title.chars().skip(offset.min(last)).take(POPUP_TITLE_CHARS).collect()
+    let last = label.chars().count().saturating_sub(max_chars);
+    label.chars().skip(offset.min(last)).take(max_chars).collect()
+}
+
+fn secondary_line(player: &PlayerInfo) -> String {
+    let mut line = player.artist.clone();
+    if !player.album.is_empty() {
+        let album = if let Some(year) = player.year {
+            format!("{} ({year})", player.album)
+        } else {
+            player.album.clone()
+        };
+        line = if line.is_empty() {
+            album
+        } else {
+            format!("{line} \u{00b7} {album}")
+        };
+    }
+    if line.is_empty() { " ".to_string() } else { line }
 }
 
 /// Cover thumbnail size: crisp enough for the popup hero, and far smaller than
@@ -1346,11 +1385,23 @@ mod tests {
     }
 
     #[test]
-    fn popup_title_reveals_tail_after_click() {
+    fn scroll_label_reveals_tail_after_click() {
         let title = "abcdefghijklmnopqrstuvwxyz123456";
-        assert_eq!(popup_title(title, None), "abcdefghijklmnopqrstuvwxyz12…");
-        assert_eq!(popup_title(title, Some(0)), "abcdefghijklmnopqrstuvwxyz12");
-        assert_eq!(popup_title(title, Some(4)), "efghijklmnopqrstuvwxyz123456");
+        assert_eq!(scroll_label(title, 28, None), "abcdefghijklmnopqrstuvwxyz12…");
+        assert_eq!(scroll_label(title, 28, Some(0)), "abcdefghijklmnopqrstuvwxyz12");
+        assert_eq!(scroll_label(title, 28, Some(4)), "efghijklmnopqrstuvwxyz123456");
+        assert_eq!(scroll_label(title, 30, None), "abcdefghijklmnopqrstuvwxyz1234…");
+    }
+
+    #[test]
+    fn secondary_line_includes_album_and_year() {
+        let player = PlayerInfo {
+            artist: "Artist".into(),
+            album: "Album".into(),
+            year: Some(2021),
+            ..Default::default()
+        };
+        assert_eq!(secondary_line(&player), "Artist · Album (2021)");
     }
 
     #[test]
