@@ -1,1 +1,0 @@
-app-title = Now Playing

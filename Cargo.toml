@@ -1,9 +1,9 @@
 [package]
-name = "cosmic-applet-now-playing"
+name = "cosmic-ext-applet-on-blast"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0"
-description = "Now Playing applet for COSMIC Desktop — inline panel art, label, and controls"
+description = "On Blast applet for COSMIC Desktop — inline panel art, label, and controls"
 
 [build-dependencies]
 vergen = { version = "8", features = ["git", "gitcl"] }
