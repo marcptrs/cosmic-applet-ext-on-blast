@@ -3,6 +3,7 @@
 **/*.rs.bk
 debug/
 target/
+graphify-out/
 vendor/
 vendor.tar
 debian/*
